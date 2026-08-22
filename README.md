@@ -4,9 +4,12 @@ An ESPHome external component that decodes the 868/915 MHz FSK telegrams sent by
 Vevor 7-in-1 weather stations (also sold under other brands using the same
 protocol) and publishes them as native ESPHome sensors.
 
-It attaches to `remote_receiver` as a dumper, so it reuses ESPHome's existing RMT
-capture path rather than bit-banging its own receiver. The decode path performs
-no heap allocation.
+It requires `remote_receiver`.
+
+> **Before you buy anything:** you need a CC1101 module for the **868 MHz**
+> band *with an 868 MHz antenna* (915 MHz for US stations). The 433 MHz modules
+> and antennas that dominate search results will not work — see
+> [Hardware](#hardware).
 
 ## What you get
 
@@ -31,7 +34,8 @@ GPIO — a bare 433 MHz OOK module will not work, and neither will an SX1276 in
 packet mode. A CC1101 is the usual choice, driven by ESPHome's built-in
 `cc1101` component:
 
-- CC1101 module for your region's band (868 MHz in the EU, 915 MHz in the US)
+- CC1101 module **for the 868 MHz band** (EU) — or 915 MHz if your station is a
+  US model. See the warning below: the band matters, and so does the antenna.
 - SPI wired to the ESP32, plus the module's data output (GDO0 or GDO2) to the
   GPIO named in `remote_receiver`
 
@@ -63,8 +67,6 @@ remote_receiver:
   id: rf_receiver
   # The CC1101's data output pin.
   pin: GPIO12
-  # Short enough not to swallow ~90us NRZ bits, and a gap long enough to end
-  # the burst after a frame.
   filter: 65us
   idle: 2000us
 
