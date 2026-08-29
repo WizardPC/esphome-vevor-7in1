@@ -77,11 +77,14 @@ class VevorDecoder : public Component, public remote_base::RemoteReceiverDumperB
 
   uint8_t bits_[MAX_BITS];  // fixed array, no heap allocation
 
-  // Rain is a monotonic tick counter, so any decrease is either corruption or
-  // a genuine counter reset (battery pull). Both look identical in a single
-  // frame, so a lower value is held back until the station has repeated it,
-  // which corruption will not do. Counts are kept as raw ticks so the
-  // repeat check is an exact integer comparison. -1 = nothing seen yet.
+  // Rain is a monotonic tick counter: it climbs, or it restarts at exactly zero
+  // after a battery pull. Any other decrease is corruption - typically the
+  // station sampling its own 16-bit counter mid-carry, which reports 256 ticks
+  // too few with a perfectly valid checksum - and is never accepted, however
+  // often it repeats. A drop to zero is the one ambiguous case, so it is held
+  // back until the station has repeated it, which corruption will not do.
+  // Counts are kept as raw ticks so the comparisons are exact integer ones.
+  // -1 = nothing seen yet.
   //
   // A station that has been power-cycled usually announces itself with a new
   // id, which resolves the ambiguity immediately: the rain counter behind a
@@ -89,8 +92,7 @@ class VevorDecoder : public Component, public remote_base::RemoteReceiverDumperB
   // shortcut, not a guarantee, so the repeat check above still backs it up.
   int32_t last_sensor_id_{-1};
   int32_t last_rain_ticks_{-1};
-  int32_t pending_rain_ticks_{-1};
-  uint8_t pending_rain_count_{0};
+  uint8_t pending_rain_reset_count_{0};
 };
 
 }  // namespace vevor_decoder

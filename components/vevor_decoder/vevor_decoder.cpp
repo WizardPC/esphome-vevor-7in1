@@ -33,9 +33,14 @@ static const int MIN_DECODED_BITS = 16 + FRAME_BITS;
 // discarding such a run destroys the frame around it.
 static const int MAX_RUN_LENGTH = 64;
 
-// Number of consecutive frames that must agree on a lower rain total before it
-// is accepted as a real counter reset rather than a corrupted frame.
+// Number of consecutive frames that must report a zeroed rain counter before it
+// is accepted as a real reset rather than a corrupted frame.
 static const uint8_t RAIN_RESET_CONFIRMATIONS = 3;
+
+// A station that samples its own 16-bit rain counter while it carries reports
+// the wrapped low byte with a stale high byte, i.e. exactly this many ticks too
+// few. The frame's checksum is correct: the station transmits what it misread.
+static const int32_t RAIN_MISSED_CARRY_TICKS = 256;
 
 // Illuminance sanity check: with a UV index of N, lux above this multiple of
 // (N + 1) is treated as a bit error rather than a real reading.
@@ -183,8 +188,7 @@ void VevorDecoder::publish_frame_(const uint8_t *b) {
     }
     this->last_sensor_id_ = sensor_id;
     this->last_rain_ticks_ = -1;
-    this->pending_rain_ticks_ = -1;
-    this->pending_rain_count_ = 0;
+    this->pending_rain_reset_count_ = 0;
   }
 
   const float temperature = (((b[5] << 8) | b[6]) - TEMP_OFFSET) * TEMP_SCALE;
@@ -199,43 +203,50 @@ void VevorDecoder::publish_frame_(const uint8_t *b) {
   if (wind_direction < 0)
     wind_direction += 360;
 
-  // The rain counter is an absolute tick count offset by BASELINE, so a value
-  // below the baseline is not merely implausible, it is impossible: even a
-  // counter reset reports exactly the baseline, i.e. 0 ticks, never fewer.
-  // Such a frame is corrupt, and nothing in it can be trusted for rain.
+  // The rain counter is an absolute tick count offset by BASELINE. It can only
+  // climb, or restart at exactly 0 after a battery pull, so every frame has a
+  // floor below which its total is impossible rather than merely implausible:
+  // the last good total, or 0 when there is nothing to compare against.
   const int32_t rain_ticks = ((b[13] << 8) | b[14]) - BASELINE;
+  const int32_t rain_floor = (this->rain_hold_ && this->last_rain_ticks_ > 0) ? this->last_rain_ticks_ : 0;
   float rain_mm = NAN;
-  if (rain_ticks < 0) {
-    ESP_LOGW(TAG, "[%04X] Impossible rain count (%d ticks), dropping the reading", sensor_id, (int) rain_ticks);
-  } else if (!this->rain_hold_ || this->last_rain_ticks_ < 0 || rain_ticks >= this->last_rain_ticks_) {
+  if (rain_ticks >= rain_floor) {
     // First reading, or the counter moved the only way it legitimately can.
     rain_mm = rain_ticks * RAIN_SCALE;
     this->last_rain_ticks_ = rain_ticks;
-    this->pending_rain_ticks_ = -1;
-    this->pending_rain_count_ = 0;
-  } else {
-    // A decrease. A bit flip produces a one-off wrong value, while a real
-    // counter reset keeps reporting the new lower total, so wait and see.
-    if (rain_ticks == this->pending_rain_ticks_) {
-      this->pending_rain_count_++;
-    } else {
-      this->pending_rain_ticks_ = rain_ticks;
-      this->pending_rain_count_ = 1;
-    }
-
-    if (this->pending_rain_count_ >= RAIN_RESET_CONFIRMATIONS) {
-      ESP_LOGI(TAG, "[%04X] Rain counter reset confirmed over %u frames, now %.2f mm", sensor_id,
-               (unsigned) this->pending_rain_count_, rain_ticks * RAIN_SCALE);
-      rain_mm = rain_ticks * RAIN_SCALE;
-      this->last_rain_ticks_ = rain_ticks;
-      this->pending_rain_ticks_ = -1;
-      this->pending_rain_count_ = 0;
+    this->pending_rain_reset_count_ = 0;
+  } else if (rain_ticks == 0) {
+    // The one decrease the counter is capable of: it was reset (battery pull)
+    // and starts over at zero. A bit flip produces a one-off wrong value, while
+    // a real reset keeps reporting zero, so wait and see.
+    this->pending_rain_reset_count_++;
+    if (this->pending_rain_reset_count_ >= RAIN_RESET_CONFIRMATIONS) {
+      ESP_LOGI(TAG, "[%04X] Rain counter reset confirmed over %u frames", sensor_id,
+               (unsigned) this->pending_rain_reset_count_);
+      rain_mm = 0.0f;
+      this->last_rain_ticks_ = 0;
+      this->pending_rain_reset_count_ = 0;
     } else {
       // Republish the last good total so the sensor stays fresh.
       rain_mm = this->last_rain_ticks_ * RAIN_SCALE;
-      ESP_LOGW(TAG, "[%04X] Rain total dropped %.2f -> %.2f mm (%u/%u), holding", sensor_id, rain_mm,
-               rain_ticks * RAIN_SCALE, (unsigned) this->pending_rain_count_,
-               (unsigned) RAIN_RESET_CONFIRMATIONS);
+      ESP_LOGW(TAG, "[%04X] Rain counter reported zero (%u/%u), holding %.2f mm", sensor_id,
+               (unsigned) this->pending_rain_reset_count_, (unsigned) RAIN_RESET_CONFIRMATIONS, rain_mm);
+    }
+  } else {
+    // Below the floor and not a reset, so the frame is wrong however sound its
+    // checksum is. The usual cause is the station sampling its own 16-bit
+    // counter mid-carry, losing exactly RAIN_MISSED_CARRY_TICKS; no number of
+    // repeats makes that value real, so it is never adopted.
+    const int32_t lost = this->last_rain_ticks_ - rain_ticks;
+    const char *cause = (lost > 0 && lost % RAIN_MISSED_CARRY_TICKS == 0) ? " (missed carry in the station)" : "";
+    this->pending_rain_reset_count_ = 0;
+    if (this->last_rain_ticks_ >= 0) {
+      rain_mm = this->last_rain_ticks_ * RAIN_SCALE;
+      ESP_LOGW(TAG, "[%04X] Impossible rain count %d ticks%s, holding %.2f mm", sensor_id, (int) rain_ticks, cause,
+               rain_mm);
+    } else {
+      ESP_LOGW(TAG, "[%04X] Impossible rain count %d ticks%s, dropping the reading", sensor_id, (int) rain_ticks,
+               cause);
     }
   }
 

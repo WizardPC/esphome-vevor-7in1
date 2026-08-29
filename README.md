@@ -110,11 +110,16 @@ Every sensor is optional; leave out the ones you do not want.
   period. Only worth touching if your receiver's timing is skewed and frames
   never validate.
 - **`rain_hold`** (*optional*, boolean, default `true`): rain is a counter that
-  can only climb, so a frame reporting a *lower* total is either corruption or a
-  genuine counter reset. If the station id changed, it is a reset and the new
-  total is taken immediately. Otherwise the previous total is held until the
-  station repeats the lower one three times, which corruption will not do but a
-  real reset will. Set to `false` to publish every total as received.
+  can only climb, or restart at exactly zero after a battery pull. A frame
+  reporting any *other* lower total is corrupt and is never accepted, however
+  often it repeats: the common cause is the station reading its own 16-bit
+  counter while it carries, which reports the wrapped low byte with a stale high
+  byte — exactly 256 ticks (59.6 mm) short, with a valid checksum, once every
+  59.6 mm of rain. A drop to zero is the ambiguous case: if the station id
+  changed it is a reset and zero is taken immediately, otherwise the previous
+  total is held until the station repeats the zero three times, which corruption
+  will not do but a real reset will. Set to `false` to publish every total as
+  received — a count below zero is impossible either way and is still rejected.
 - **`illuminance_filter`** (*optional*, boolean, default `true`): drop
   illuminance readings that contradict the UV index in the same frame — zero lux
   with non-zero UV, or lux far above what the reported UV index allows. This is
