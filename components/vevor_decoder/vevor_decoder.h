@@ -6,14 +6,12 @@
 #include "esphome/components/remote_base/remote_base.h"
 #include "esphome/components/remote_receiver/remote_receiver.h"
 #include "esphome/components/sensor/sensor.h"
+#include <vector>
 
 namespace esphome {
 namespace vevor_decoder {
 
-// Augmenté de 512 à 2048 bits pour que les salves précédées de bruit radio
-// (~500 impulsions) ne soient jamais tronquées avant la fin de la trame.
 static const int MAX_BITS = 2048;
-
 static const int32_t SENSOR_ID_ANY = -1;
 
 class VevorDecoder : public Component, public remote_base::RemoteReceiverDumperBase {
@@ -41,8 +39,7 @@ class VevorDecoder : public Component, public remote_base::RemoteReceiverDumperB
   bool dump(remote_base::RemoteReceiveData src) override;
 
  protected:
-  // Convertit les durées brutes en bits NRZ en compensant un éventuel biais
-  // d'asymétrie FSK (skew_us) entre les impulsions positives et négatives.
+  bool try_decode_raw_(const std::vector<int32_t> &raw);
   int timings_to_bits_(const std::vector<int32_t> &raw, int skew_us = 0);
   bool extract_frame_(int bit_offset, uint8_t inv, uint8_t *out);
   void publish_frame_(const uint8_t *b);
@@ -65,6 +62,7 @@ class VevorDecoder : public Component, public remote_base::RemoteReceiverDumperB
   bool illuminance_filter_{true};
 
   uint8_t bits_[MAX_BITS];
+  std::vector<int32_t> prev_fragment_;
 
   int32_t last_sensor_id_{-1};
   int32_t last_rain_ticks_{-1};
