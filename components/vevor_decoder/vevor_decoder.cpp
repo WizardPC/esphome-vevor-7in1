@@ -23,7 +23,7 @@ static const int MIN_DECODED_BITS = 16 + FRAME_BITS;
 static const int MAX_RUN_LENGTH = 64;
 
 static const uint8_t RAIN_RESET_CONFIRMATIONS = 3;
-static const int32_t RAIN_MAX_STEP_TICKS = 3;  // Au-delà de +3 basculements en 20s, exige confirmation
+static const int32_t RAIN_MAX_STEP_TICKS = 3;
 static const int32_t RAIN_MISSED_CARRY_TICKS = 256;
 static const float LUX_PER_UV_STEP = 20000.0f;
 
@@ -40,7 +40,7 @@ void VevorDecoder::setup() {
 }
 
 void VevorDecoder::dump_config() {
-  ESP_LOGCONFIG(TAG, "Vevor 7-in-1 Weather Station Decoder (v4 Anti-Collision):");
+  ESP_LOGCONFIG(TAG, "Vevor 7-in-1 Weather Station Decoder (v3.1):");
   if (this->sensor_id_ == SENSOR_ID_ANY) {
     ESP_LOGCONFIG(TAG, "  Station ID filter: any");
   } else {
@@ -102,8 +102,6 @@ bool VevorDecoder::extract_frame_(int bit_offset, uint8_t inv, uint8_t *out) {
   return (checksum & 0xFF) == out[FRAME_BYTES - 2];
 }
 
-// Vérifie la cohérence physique de la trame AVANT de l'accepter comme valide
-// (élimine les collisions 1/256 du checksum 8-bit lors d'un décalage d'un bit).
 bool VevorDecoder::is_frame_plausible_(const uint8_t *b) {
   const float temperature = (((b[5] << 8) | b[6]) - TEMP_OFFSET) * TEMP_SCALE;
   const float humidity = (float) b[7];
@@ -117,42 +115,26 @@ bool VevorDecoder::is_frame_plausible_(const uint8_t *b) {
   if (wind_direction < 0)
     wind_direction += 360;
 
-  int uv_index = (b[15] & 0x1F) - 1;
-  if (uv_index < 0)
-    uv_index = 0;
-
-  // 1. Limites absolues des capteurs
-  if (temperature < -40.0f || temperature > 60.0f || humidity < 5.0f || humidity > 100.0f ||
-      wind_speed > 160.0f || wind_gust > 200.0f || wind_direction > 360 || uv_index > 15) {
+  if (temperature < -45.0f || temperature > 65.0f || humidity < 1.0f || humidity > 100.0f ||
+      wind_speed > 180.0f || wind_gust > 220.0f || wind_direction > 360) {
     return false;
   }
 
-  // 2. Détection du bit-shift sur le vent (ex: 0x0101 -> 0x0181 donnant wind=15.4 km/h avec gust=0.0 km/h)
-  if ((wind_gust == 0.0f && wind_speed > 4.0f) || (wind_speed > wind_gust + 8.0f)) {
-    ESP_LOGW(TAG, "Rejet bit-shift vent : wind=%.1f km/h incoherent avec gust=%.1f km/h", wind_speed, wind_gust);
-    return false;
-  }
-
-  // 3. Continuité thermique et hygrométrique (empêche un saut > 4°C ou > 12% d'humidité en 20s)
-  if (!std::isnan(this->last_temp_) && std::fabs(temperature - this->last_temp_) > 4.0f) {
-    ESP_LOGW(TAG, "Rejet saut T° suspect : %.1f°C vs %.1f°C", temperature, this->last_temp_);
-    return false;
-  }
-  if (!std::isnan(this->last_hum_) && std::fabs(humidity - this->last_hum_) > 12.0f) {
-    ESP_LOGW(TAG, "Rejet saut Humidite suspect : %.0f%% vs %.0f%%", humidity, this->last_hum_);
+  // Rejette le bit-shift classique 0x0101 -> 0x0181 (wind = 15.4 km/h alors que gust = 0.0 km/h)
+  if (wind_gust == 0.0f && wind_speed > 5.0f) {
+    ESP_LOGW(TAG, "Rejet trame corrompue : wind=%.1f km/h alors que gust=0.0 km/h", wind_speed);
     return false;
   }
 
   return true;
 }
 
-bool VevorDecoder::try_decode_raw_(const std::vector<int32_t> &raw, int max_skews) {
-  // Paliers resserrés : évite que des paliers extrêmes (25, 28) ne fabriquent de fausses trames
-  static const int SKEW_CANDIDATES[] = {0, 6, -6, 12, -12, 18};
-  const int count = (max_skews < 6) ? max_skews : 6;
+bool VevorDecoder::try_decode_raw_(const std::vector<int32_t> &raw) {
+  // Même grille complète que la v3 qui a décodé toutes les salves pendant 2h25
+  static const int SKEW_CANDIDATES[] = {0, 7, -7, 14, -14, 21, 25, 28};
 
-  for (int s = 0; s < count; s++) {
-    const int bit_count = this->timings_to_bits_(raw, SKEW_CANDIDATES[s]);
+  for (int skew : SKEW_CANDIDATES) {
+    const int bit_count = this->timings_to_bits_(raw, skew);
     if (bit_count < MIN_DECODED_BITS)
       continue;
 
@@ -175,7 +157,8 @@ bool VevorDecoder::try_decode_raw_(const std::vector<int32_t> &raw, int max_skew
 
         const uint16_t sensor_id = (frame[2] << 8) | frame[3];
         if (this->sensor_id_ != SENSOR_ID_ANY && sensor_id != (uint16_t) this->sensor_id_) {
-          return false;
+          // continue (et surtout pas return false) pour tester les autres skews !
+          continue;
         }
 
         if (!this->is_frame_plausible_(frame)) {
@@ -197,18 +180,17 @@ bool VevorDecoder::dump(remote_base::RemoteReceiveData src) {
   if (raw_size < MIN_RAW_TIMINGS)
     return false;
 
-  // 1. Décodage direct d'une trame entière (6 paliers de skew autorisés)
-  if (this->try_decode_raw_(raw, 6)) {
+  // 1. Tentative de décodage direct de la salve entière
+  if (this->try_decode_raw_(raw)) {
     this->prev_fragment_.clear();
     return true;
   }
 
-  // 2. Recollage strict des trames coupées par wind_gust = 0 km/h :
-  // Uniquement -180 us (2 bits) et -90 us (1 bit), et uniquement sur les 3 premiers skews (0, +6, -6)
-  // pour réduire par 10 le risque de collision de checksum 8-bit !
-  if (raw_size >= 65 && raw_size <= 120) {
+  // 2. Recollage des trames coupées par idle: 1100us lorsque wind_gust = 0.0 km/h
+  // (Même plage 40..140 que la v3, mais sans les valeurs 0 et -1350 us qui créaient de fausses trames)
+  if (raw_size >= 40 && raw_size <= 140) {
     if (!this->prev_fragment_.empty()) {
-      static const int32_t EXTRA_ZERO_US[] = {-180, -90};
+      static const int32_t EXTRA_ZERO_US[] = {-180, -90, -270};
       for (int32_t extra : EXTRA_ZERO_US) {
         std::vector<int32_t> stitched = this->prev_fragment_;
         if (stitched.back() < 0) {
@@ -218,8 +200,8 @@ bool VevorDecoder::dump(remote_base::RemoteReceiveData src) {
         }
         stitched.insert(stitched.end(), raw.begin(), raw.end());
 
-        if (this->try_decode_raw_(stitched, 3)) {
-          ESP_LOGI(TAG, "Trame coupee reconstruite (%d + %d impulsions, extra=%d us)",
+        if (this->try_decode_raw_(stitched)) {
+          ESP_LOGI(TAG, "Trame coupee reconstruite avec succes (%d + %d impulsions, extra=%d us)",
                    (int) this->prev_fragment_.size(), raw_size, (int) extra);
           this->prev_fragment_.clear();
           return true;
@@ -238,13 +220,7 @@ void VevorDecoder::publish_frame_(const uint8_t *b) {
   const uint16_t sensor_id = (b[2] << 8) | b[3];
   const bool raw_battery_low = (b[4] & 0x80) != 0;
 
-  const float temperature = (((b[5] << 8) | b[6]) - TEMP_OFFSET) * TEMP_SCALE;
-  const float humidity = (float) b[7];
-
-  this->last_temp_ = temperature;
-  this->last_hum_ = humidity;
-
-  // Anti-rebond sur battery_low : exige 2 trames consécutives pour changer d'état
+  // Anti-rebond sur battery_low (évite une fausse alerte sur 1 seule trame)
   if (raw_battery_low != this->last_battery_low_) {
     this->battery_low_confirm_++;
     if (this->battery_low_confirm_ >= 2) {
@@ -255,6 +231,9 @@ void VevorDecoder::publish_frame_(const uint8_t *b) {
     this->battery_low_confirm_ = 0;
   }
   const bool battery_low = this->last_battery_low_;
+
+  const float temperature = (((b[5] << 8) | b[6]) - TEMP_OFFSET) * TEMP_SCALE;
+  const float humidity = (float) b[7];
 
   float wind_speed = (((b[8] << 8) | b[9]) - BASELINE) / WIND_SCALE;
   if (wind_speed < 0.0f)
@@ -281,9 +260,8 @@ void VevorDecoder::publish_frame_(const uint8_t *b) {
   float rain_mm = NAN;
 
   if (rain_ticks >= rain_floor) {
-    // Protection anti-empoisonnement du compteur de pluie :
-    // Si la pluie bondit de plus de 3 ticks (> 0.7 mm en 20s) d'un seul coup,
-    // on attend qu'une 2e trame confirme cette nouvelle valeur avant de verrouiller last_rain_ticks_ !
+    // Protection contre les sauts de pluie corrompus (ex: 41.9 mm -> 143.8 mm -> 3783.0 mm) :
+    // Si le compteur bondit de > 3 ticks d'un coup, exige une confirmation sur une 2e trame.
     if (this->last_rain_ticks_ >= 0 && (rain_ticks - this->last_rain_ticks_) > RAIN_MAX_STEP_TICKS) {
       if (std::abs(rain_ticks - this->pending_rain_jump_ticks_) <= 2) {
         ESP_LOGI(TAG, "[%04X] Saut de pluie confirme (%d -> %d ticks)",
@@ -294,7 +272,7 @@ void VevorDecoder::publish_frame_(const uint8_t *b) {
       } else {
         this->pending_rain_jump_ticks_ = rain_ticks;
         rain_mm = this->last_rain_ticks_ * RAIN_SCALE;
-        ESP_LOGW(TAG, "[%04X] Saut de pluie suspect (%d -> %d ticks) mis en attente de confirmation, maintien de %.1f mm",
+        ESP_LOGW(TAG, "[%04X] Saut de pluie suspect (%d -> %d ticks) ignore en attente de confirmation, maintien de %.1f mm",
                  sensor_id, (int) this->last_rain_ticks_, (int) rain_ticks, rain_mm);
       }
     } else {
