@@ -1,9 +1,5 @@
 #pragma once
 // Vevor 7-in-1 Weather Station decoder for ESPHome.
-//
-// Hooks into remote_receiver as a dumper and decodes the FSK-demodulated
-// output of a CC1101 (or similar) 868/915 MHz receiver. The decode path does
-// no heap allocation.
 
 #include "esphome/core/component.h"
 #include "esphome/components/binary_sensor/binary_sensor.h"
@@ -14,11 +10,10 @@
 namespace esphome {
 namespace vevor_decoder {
 
-// Frames are 21 bytes (168 bits) after the sync word. Allow room for the
-// preamble plus a couple of repeats so the sync search has somewhere to look.
-static const int MAX_BITS = 1024; //512
+// Augmenté de 512 à 2048 bits pour que les salves précédées de bruit radio
+// (~500 impulsions) ne soient jamais tronquées avant la fin de la trame.
+static const int MAX_BITS = 2048;
 
-// Sentinel for "accept any station id".
 static const int32_t SENSOR_ID_ANY = -1;
 
 class VevorDecoder : public Component, public remote_base::RemoteReceiverDumperBase {
@@ -35,13 +30,9 @@ class VevorDecoder : public Component, public remote_base::RemoteReceiverDumperB
   void set_illuminance_sensor(sensor::Sensor *s) { this->light_ = s; }
   void set_battery_low_binary_sensor(binary_sensor::BinarySensor *s) { this->battery_ = s; }
 
-  // Only publish frames from this station id. SENSOR_ID_ANY accepts all.
   void set_sensor_id(int32_t sensor_id) { this->sensor_id_ = sensor_id; }
-  // NRZ bit period of the on-air signal, in microseconds.
   void set_bit_period(uint32_t bit_period_us) { this->bit_period_ = bit_period_us; }
-  // Hold the previous rain total when a frame reports a lower one.
   void set_rain_hold(bool rain_hold) { this->rain_hold_ = rain_hold; }
-  // Drop illuminance readings that contradict the UV index in the same frame.
   void set_illuminance_filter(bool enabled) { this->illuminance_filter_ = enabled; }
 
   float get_setup_priority() const override { return setup_priority::DATA; }
@@ -50,11 +41,9 @@ class VevorDecoder : public Component, public remote_base::RemoteReceiverDumperB
   bool dump(remote_base::RemoteReceiveData src) override;
 
  protected:
-  // Turns the raw mark/space timings into NRZ bits in bits_.
-  // Returns the number of bits produced.
-  int timings_to_bits_(const std::vector<int32_t> &raw);
-  // Reads 21 bytes starting at bit offset, applying inversion, and verifies
-  // the header and checksum. Returns true if the frame is sound.
+  // Convertit les durées brutes en bits NRZ en compensant un éventuel biais
+  // d'asymétrie FSK (skew_us) entre les impulsions positives et négatives.
+  int timings_to_bits_(const std::vector<int32_t> &raw, int skew_us = 0);
   bool extract_frame_(int bit_offset, uint8_t inv, uint8_t *out);
   void publish_frame_(const uint8_t *b);
 
@@ -75,21 +64,8 @@ class VevorDecoder : public Component, public remote_base::RemoteReceiverDumperB
   bool rain_hold_{true};
   bool illuminance_filter_{true};
 
-  uint8_t bits_[MAX_BITS];  // fixed array, no heap allocation
+  uint8_t bits_[MAX_BITS];
 
-  // Rain is a monotonic tick counter: it climbs, or it restarts at exactly zero
-  // after a battery pull. Any other decrease is corruption - typically the
-  // station sampling its own 16-bit counter mid-carry, which reports 256 ticks
-  // too few with a perfectly valid checksum - and is never accepted, however
-  // often it repeats. A drop to zero is the one ambiguous case, so it is held
-  // back until the station has repeated it, which corruption will not do.
-  // Counts are kept as raw ticks so the comparisons are exact integer ones.
-  // -1 = nothing seen yet.
-  //
-  // A station that has been power-cycled usually announces itself with a new
-  // id, which resolves the ambiguity immediately: the rain counter behind a
-  // new id has nothing to do with the one we were tracking. That is only a
-  // shortcut, not a guarantee, so the repeat check above still backs it up.
   int32_t last_sensor_id_{-1};
   int32_t last_rain_ticks_{-1};
   uint8_t pending_rain_reset_count_{0};
