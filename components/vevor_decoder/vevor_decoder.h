@@ -39,9 +39,10 @@ class VevorDecoder : public Component, public remote_base::RemoteReceiverDumperB
   bool dump(remote_base::RemoteReceiveData src) override;
 
  protected:
-  bool try_decode_raw_(const std::vector<int32_t> &raw);
+  bool try_decode_raw_(const std::vector<int32_t> &raw, int max_skews);
   int timings_to_bits_(const std::vector<int32_t> &raw, int skew_us = 0);
   bool extract_frame_(int bit_offset, uint8_t inv, uint8_t *out);
+  bool is_frame_plausible_(const uint8_t *b);
   void publish_frame_(const uint8_t *b);
 
   remote_receiver::RemoteReceiverComponent *receiver_{nullptr};
@@ -66,7 +67,13 @@ class VevorDecoder : public Component, public remote_base::RemoteReceiverDumperB
 
   int32_t last_sensor_id_{-1};
   int32_t last_rain_ticks_{-1};
+  int32_t pending_rain_jump_ticks_{-1};
   uint8_t pending_rain_reset_count_{0};
+
+  float last_temp_{NAN};
+  float last_hum_{NAN};
+  bool last_battery_low_{false};
+  uint8_t battery_low_confirm_{0};
 };
 
 }  // namespace vevor_decoder
