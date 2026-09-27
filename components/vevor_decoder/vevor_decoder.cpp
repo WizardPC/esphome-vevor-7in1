@@ -39,7 +39,7 @@ void VevorDecoder::setup() {
 }
 
 void VevorDecoder::dump_config() {
-  ESP_LOGCONFIG(TAG, "Vevor 7-in-1 Weather Station Decoder:");
+  ESP_LOGCONFIG(TAG, "Vevor 7-in-1 Weather Station Decoder (v2):");
   if (this->sensor_id_ == SENSOR_ID_ANY) {
     ESP_LOGCONFIG(TAG, "  Station ID filter: any");
   } else {
