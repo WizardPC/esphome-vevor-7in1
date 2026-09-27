@@ -39,7 +39,7 @@ void VevorDecoder::setup() {
 }
 
 void VevorDecoder::dump_config() {
-  ESP_LOGCONFIG(TAG, "Vevor 7-in-1 Weather Station Decoder (v2):");
+  ESP_LOGCONFIG(TAG, "Vevor 7-in-1 Weather Station Decoder (v3):");
   if (this->sensor_id_ == SENSOR_ID_ANY) {
     ESP_LOGCONFIG(TAG, "  Station ID filter: any");
   } else {
@@ -66,9 +66,6 @@ int VevorDecoder::timings_to_bits_(const std::vector<int32_t> &raw, int skew_us)
 
   for (int32_t val : raw) {
     const uint8_t bit_val = val > 0 ? 1 : 0;
-    // Compense l'asymétrie FSK éventuelle du démodulateur CC1101 :
-    // - Si skew_us > 0 : réduit la durée des '1' (val > 0) et augmente la durée absolue des '0' (val < 0)
-    // - Si skew_us < 0 : inversement
     int duration = (val > 0) ? (val - skew_us) : (-val + skew_us);
     if (duration < 1)
       duration = 1;
@@ -104,17 +101,9 @@ bool VevorDecoder::extract_frame_(int bit_offset, uint8_t inv, uint8_t *out) {
   return (checksum & 0xFF) == out[FRAME_BYTES - 2];
 }
 
-bool VevorDecoder::dump(remote_base::RemoteReceiveData src) {
-  const auto &raw = src.get_raw_data();
-  const int raw_size = (int) raw.size();
-
-  if (raw_size < MIN_RAW_TIMINGS)
-    return false;
-
-  // Balayage multi-passes des biais d'asymétrie FSK courants (en microsecondes) :
-  // Permet de décoder les modules CC1101 présentant un décalage de fréquence
-  // qui élargit les bits '1' et raccourcit les bits '0' (ou inversement).
-  static const int SKEW_CANDIDATES[] = {0, 7, -7, 14, -14, 21};
+bool VevorDecoder::try_decode_raw_(const std::vector<int32_t> &raw) {
+  // Conserve les paliers v2 {0, 7, -7, 14, -14, 21} + ajoute 25 et 28 pour les salves très asymétriques
+  static const int SKEW_CANDIDATES[] = {0, 7, -7, 14, -14, 21, 25, 28};
 
   for (int skew : SKEW_CANDIDATES) {
     const int bit_count = this->timings_to_bits_(raw, skew);
@@ -140,7 +129,6 @@ bool VevorDecoder::dump(remote_base::RemoteReceiveData src) {
 
         const uint16_t sensor_id = (frame[2] << 8) | frame[3];
         if (this->sensor_id_ != SENSOR_ID_ANY && sensor_id != (uint16_t) this->sensor_id_) {
-          ESP_LOGV(TAG, "Ignoring frame from station 0x%04X (filtered)", sensor_id);
           return false;
         }
 
@@ -152,6 +140,51 @@ bool VevorDecoder::dump(remote_base::RemoteReceiveData src) {
   return false;
 }
 
+bool VevorDecoder::dump(remote_base::RemoteReceiveData src) {
+  const auto &raw = src.get_raw_data();
+  const int raw_size = (int) raw.size();
+
+  if (raw_size < MIN_RAW_TIMINGS)
+    return false;
+
+  // 1. Tentative de décodage direct de la salve entière (~180 impulsions / 340 bits)
+  if (this->try_decode_raw_(raw)) {
+    this->prev_fragment_.clear();
+    return true;
+  }
+
+  // 2. Recollage des trames coupées par idle: 1100us lorsque wind_gust = 0.0 km/h
+  // (Morceau 1 = ~94 impulsions / 156 bits, Morceau 2 = ~80 impulsions / 182 bits -> 338 bits sur 340).
+  if (raw_size >= 40 && raw_size <= 140) {
+    if (!this->prev_fragment_.empty()) {
+      // Teste l'ajout des 1 à 4 bits manquants (90 à 360 us) après la coupure idle de 1100 us,
+      // ainsi que 13 à 15 bits (1170 à 1350 us) si l'impulsion idle entière a été omise.
+      static const int32_t EXTRA_ZERO_US[] = {-180, -90, -270, -360, 0, -1170, -1260, -1350};
+      for (int32_t extra : EXTRA_ZERO_US) {
+        std::vector<int32_t> stitched = this->prev_fragment_;
+        if (stitched.back() < 0) {
+          stitched.back() += extra;  // Allonge la dernière impulsion négative de prev_fragment_
+        } else if (extra < 0) {
+          stitched.push_back(extra);
+        }
+        stitched.insert(stitched.end(), raw.begin(), raw.end());
+
+        if (this->try_decode_raw_(stitched)) {
+          ESP_LOGI(TAG, "Trame coupee reconstruite avec succes (%d + %d impulsions, extra=%d us)",
+                   (int) this->prev_fragment_.size(), raw_size, (int) extra);
+          this->prev_fragment_.clear();
+          return true;
+        }
+      }
+    }
+    this->prev_fragment_ = raw;
+  } else {
+    this->prev_fragment_.clear();
+  }
+
+  return false;
+}
+
 void VevorDecoder::publish_frame_(const uint8_t *b) {
   const uint16_t sensor_id = (b[2] << 8) | b[3];
   const bool battery_low = (b[4] & 0x80) != 0;
@@ -159,9 +192,18 @@ void VevorDecoder::publish_frame_(const uint8_t *b) {
   const float temperature = (((b[5] << 8) | b[6]) - TEMP_OFFSET) * TEMP_SCALE;
   const float humidity = (float) b[7];
 
-  // Garde-fou : rejette les trames corrompues qui passeraient le checksum 8-bit par hasard (1/256)
-  if (temperature < -50.0f || temperature > 70.0f || humidity < 1.0f || humidity > 100.0f) {
-    ESP_LOGW(TAG, "[%04X] Implausible T=%.1f°C or H=%.0f%%, dropping corrupted frame",
+  float wind_speed = (((b[8] << 8) | b[9]) - BASELINE) / WIND_SCALE;
+  if (wind_speed < 0.0f)
+    wind_speed = 0.0f;
+  const float wind_gust = b[10] / GUST_SCALE;
+
+  int wind_direction = (((b[11] & 0x0F) << 8) | b[12]) - BASELINE;
+  if (wind_direction < 0)
+    wind_direction += 360;
+
+  if (temperature < -45.0f || temperature > 65.0f || humidity < 1.0f || humidity > 100.0f ||
+      wind_speed > 180.0f || wind_gust > 220.0f || wind_direction > 360) {
+    ESP_LOGW(TAG, "[%04X] Implausible sensor values (T=%.1f H=%.0f), dropping corrupted frame",
              sensor_id, temperature, humidity);
     return;
   }
@@ -175,15 +217,6 @@ void VevorDecoder::publish_frame_(const uint8_t *b) {
     this->last_rain_ticks_ = -1;
     this->pending_rain_reset_count_ = 0;
   }
-
-  float wind_speed = (((b[8] << 8) | b[9]) - BASELINE) / WIND_SCALE;
-  if (wind_speed < 0.0f)
-    wind_speed = 0.0f;
-  const float wind_gust = b[10] / GUST_SCALE;
-
-  int wind_direction = (((b[11] & 0x0F) << 8) | b[12]) - BASELINE;
-  if (wind_direction < 0)
-    wind_direction += 360;
 
   const int32_t rain_ticks = ((b[13] << 8) | b[14]) - BASELINE;
   const int32_t rain_floor = (this->rain_hold_ && this->last_rain_ticks_ > 0) ? this->last_rain_ticks_ : 0;
