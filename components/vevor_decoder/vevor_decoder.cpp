@@ -114,7 +114,7 @@ bool VevorDecoder::dump(remote_base::RemoteReceiveData src) {
   // Balayage multi-passes des biais d'asymétrie FSK courants (en microsecondes) :
   // Permet de décoder les modules CC1101 présentant un décalage de fréquence
   // qui élargit les bits '1' et raccourcit les bits '0' (ou inversement).
-  static const int SKEW_CANDIDATES[] = {0, 22, 14, 28, -14, -22, -28};
+  static const int SKEW_CANDIDATES[] = {0, 7, -7, 14, -14, 21};
 
   for (int skew : SKEW_CANDIDATES) {
     const int bit_count = this->timings_to_bits_(raw, skew);
