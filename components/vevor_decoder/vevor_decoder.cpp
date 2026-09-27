@@ -25,7 +25,7 @@ static const uint8_t SYNC_WORD[16] = {
 // that many bits is not worth converting. The real filtering is done by the
 // sync word and the checksum.
 static const int MIN_RAW_TIMINGS = 40;
-static const int MIN_FIRST_MARK_US = 1000;
+static const int MIN_FIRST_MARK_US = 50; //1000
 static const int MIN_DECODED_BITS = 16 + FRAME_BITS;
 // A run longer than this many bit periods is a gap between bursts rather than
 // payload. It has to be generous: NRZ payload legitimately contains long runs
