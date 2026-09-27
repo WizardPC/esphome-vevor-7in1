@@ -16,7 +16,7 @@ namespace vevor_decoder {
 
 // Frames are 21 bytes (168 bits) after the sync word. Allow room for the
 // preamble plus a couple of repeats so the sync search has somewhere to look.
-static const int MAX_BITS = 512;
+static const int MAX_BITS = 1024; //512
 
 // Sentinel for "accept any station id".
 static const int32_t SENSOR_ID_ANY = -1;
