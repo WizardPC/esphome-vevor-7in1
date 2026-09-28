@@ -12,6 +12,7 @@ static const char *const TAG = "vevor_decoder";
 
 static const int FRAME_BYTES = 21;
 static const int FRAME_BITS = FRAME_BYTES * 8;  // 168
+static const int CHECKSUM_INDEX = FRAME_BYTES - 2;  // 19 (les octets 0..18 sont sommés, l'octet 20 est inutilisé)
 
 static const uint8_t SYNC_WORD[16] = {
     1, 1, 0, 0, 1, 0, 1, 0,  // 0xCA
@@ -19,6 +20,7 @@ static const uint8_t SYNC_WORD[16] = {
 };
 
 static const int MIN_RAW_TIMINGS = 40;
+static const int MAX_FRAGMENT_TIMINGS = 140;
 static const int MIN_DECODED_BITS = 16 + FRAME_BITS;
 static const int MAX_RUN_LENGTH = 64;
 
@@ -35,12 +37,14 @@ static const float GUST_SCALE = 1.25f;
 static const float RAIN_SCALE = 0.233f;
 
 void VevorDecoder::setup() {
+  this->prev_fragment_.reserve(MAX_FRAGMENT_TIMINGS);
+  this->stitched_.reserve(MAX_FRAGMENT_TIMINGS * 2 + 1);
   this->receiver_->register_dumper(this);
   ESP_LOGD(TAG, "Registered with remote_receiver");
 }
 
 void VevorDecoder::dump_config() {
-  ESP_LOGCONFIG(TAG, "Vevor 7-in-1 Weather Station Decoder (v3.1):");
+  ESP_LOGCONFIG(TAG, "Vevor 7-in-1 Weather Station Decoder (v3.2):");
   if (this->sensor_id_ == SENSOR_ID_ANY) {
     ESP_LOGCONFIG(TAG, "  Station ID filter: any");
   } else {
@@ -85,24 +89,34 @@ int VevorDecoder::timings_to_bits_(const std::vector<int32_t> &raw, int skew_us)
   return bit_count;
 }
 
-bool VevorDecoder::extract_frame_(int bit_offset, uint8_t inv, uint8_t *out) {
-  for (int k = 0; k < FRAME_BYTES; k++) {
-    uint8_t byte = 0;
-    for (int m = 0; m < 8; m++)
-      byte = (byte << 1) | (this->bits_[bit_offset + k * 8 + m] ^ inv);
-    out[k] = byte;
+bool VevorDecoder::extract_frame_(int bit_offset, uint8_t inv, uint8_t *out) const {
+  uint8_t first_byte = 0;
+  for (int m = 0; m < 8; m++) {
+    first_byte = (first_byte << 1) | (this->bits_[bit_offset + m] ^ inv);
   }
-
-  if (out[0] != 0xAA)
+  if (first_byte != 0xAA)
     return false;
 
-  uint16_t checksum = 0;
-  for (int k = 0; k < FRAME_BYTES - 2; k++)
-    checksum += out[k];
-  return (checksum & 0xFF) == out[FRAME_BYTES - 2];
+  out[0] = first_byte;
+  uint16_t checksum = first_byte;
+
+  for (int k = 1; k <= CHECKSUM_INDEX; k++) {
+    uint8_t byte = 0;
+    const int base = bit_offset + k * 8;
+    for (int m = 0; m < 8; m++) {
+      byte = (byte << 1) | (this->bits_[base + m] ^ inv);
+    }
+    out[k] = byte;
+    if (k < CHECKSUM_INDEX) {
+      checksum += byte;
+    }
+  }
+
+  out[FRAME_BYTES - 1] = 0;
+  return (checksum & 0xFF) == out[CHECKSUM_INDEX];
 }
 
-bool VevorDecoder::is_frame_plausible_(const uint8_t *b) {
+bool VevorDecoder::is_frame_plausible_(const uint8_t *b) const {
   const float temperature = (((b[5] << 8) | b[6]) - TEMP_OFFSET) * TEMP_SCALE;
   const float humidity = (float) b[7];
 
@@ -140,34 +154,34 @@ bool VevorDecoder::try_decode_raw_(const std::vector<int32_t> &raw) {
 
     const int limit = bit_count - 16 - FRAME_BITS;
     for (int i = 0; i <= limit; i++) {
-      for (uint8_t inv = 0; inv < 2; inv++) {
-        bool match = true;
-        for (int j = 0; j < 16; j++) {
-          if (this->bits_[i + j] != (SYNC_WORD[j] ^ inv)) {
-            match = false;
-            break;
-          }
+      // Déduit directement la polarité candidate à partir du premier bit du préambule
+      const uint8_t inv = this->bits_[i] ^ SYNC_WORD[0];
+      bool match = true;
+      for (int j = 1; j < 16; j++) {
+        if (this->bits_[i + j] != (SYNC_WORD[j] ^ inv)) {
+          match = false;
+          break;
         }
-        if (!match)
-          continue;
-
-        uint8_t frame[FRAME_BYTES];
-        if (!this->extract_frame_(i + 16, inv, frame))
-          continue;
-
-        const uint16_t sensor_id = (frame[2] << 8) | frame[3];
-        if (this->sensor_id_ != SENSOR_ID_ANY && sensor_id != (uint16_t) this->sensor_id_) {
-          // continue (et surtout pas return false) pour tester les autres skews !
-          continue;
-        }
-
-        if (!this->is_frame_plausible_(frame)) {
-          continue;
-        }
-
-        this->publish_frame_(frame);
-        return true;
       }
+      if (!match)
+        continue;
+
+      uint8_t frame[FRAME_BYTES];
+      if (!this->extract_frame_(i + 16, inv, frame))
+        continue;
+
+      const uint16_t sensor_id = (frame[2] << 8) | frame[3];
+      if (this->sensor_id_ != SENSOR_ID_ANY && sensor_id != (uint16_t) this->sensor_id_) {
+        // continue (et surtout pas return false) pour tester les autres skews !
+        continue;
+      }
+
+      if (!this->is_frame_plausible_(frame)) {
+        continue;
+      }
+
+      this->publish_frame_(frame);
+      return true;
     }
   }
   return false;
@@ -188,19 +202,19 @@ bool VevorDecoder::dump(remote_base::RemoteReceiveData src) {
 
   // 2. Recollage des trames coupées par idle: 1100us lorsque wind_gust = 0.0 km/h
   // (Même plage 40..140 que la v3, mais sans les valeurs 0 et -1350 us qui créaient de fausses trames)
-  if (raw_size >= 40 && raw_size <= 140) {
+  if (raw_size >= MIN_RAW_TIMINGS && raw_size <= MAX_FRAGMENT_TIMINGS) {
     if (!this->prev_fragment_.empty()) {
       static const int32_t EXTRA_ZERO_US[] = {-180, -90, -270};
       for (int32_t extra : EXTRA_ZERO_US) {
-        std::vector<int32_t> stitched = this->prev_fragment_;
-        if (stitched.back() < 0) {
-          stitched.back() += extra;
+        this->stitched_.assign(this->prev_fragment_.begin(), this->prev_fragment_.end());
+        if (this->stitched_.back() < 0) {
+          this->stitched_.back() += extra;
         } else {
-          stitched.push_back(extra);
+          this->stitched_.push_back(extra);
         }
-        stitched.insert(stitched.end(), raw.begin(), raw.end());
+        this->stitched_.insert(this->stitched_.end(), raw.begin(), raw.end());
 
-        if (this->try_decode_raw_(stitched)) {
+        if (this->try_decode_raw_(this->stitched_)) {
           ESP_LOGI(TAG, "Trame coupee reconstruite avec succes (%d + %d impulsions, extra=%d us)",
                    (int) this->prev_fragment_.size(), raw_size, (int) extra);
           this->prev_fragment_.clear();
@@ -208,7 +222,7 @@ bool VevorDecoder::dump(remote_base::RemoteReceiveData src) {
         }
       }
     }
-    this->prev_fragment_ = raw;
+    this->prev_fragment_.assign(raw.begin(), raw.end());
   } else {
     this->prev_fragment_.clear();
   }
