@@ -1,5 +1,5 @@
 #pragma once
-// Vevor 7-in-1 Weather Station decoder for ESPHome.
+// Vevor 7-in-1 Weather Station decoder for ESPHome (v3.2).
 
 #include "esphome/core/component.h"
 #include "esphome/components/binary_sensor/binary_sensor.h"
@@ -41,8 +41,8 @@ class VevorDecoder : public Component, public remote_base::RemoteReceiverDumperB
  protected:
   bool try_decode_raw_(const std::vector<int32_t> &raw);
   int timings_to_bits_(const std::vector<int32_t> &raw, int skew_us = 0);
-  bool extract_frame_(int bit_offset, uint8_t inv, uint8_t *out);
-  bool is_frame_plausible_(const uint8_t *b);
+  bool extract_frame_(int bit_offset, uint8_t inv, uint8_t *out) const;
+  bool is_frame_plausible_(const uint8_t *b) const;
   void publish_frame_(const uint8_t *b);
 
   remote_receiver::RemoteReceiverComponent *receiver_{nullptr};
@@ -64,6 +64,7 @@ class VevorDecoder : public Component, public remote_base::RemoteReceiverDumperB
 
   uint8_t bits_[MAX_BITS];
   std::vector<int32_t> prev_fragment_;
+  std::vector<int32_t> stitched_;
 
   int32_t last_sensor_id_{-1};
   int32_t last_rain_ticks_{-1};
